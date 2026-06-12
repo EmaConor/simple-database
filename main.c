@@ -1,7 +1,40 @@
 #include <stdbool.h>  // Boolean values
 #include <stdio.h>    // Standard inputs/outpus functions (printf, getline)
 #include <stdlib.h>   // Memory allocation (mallc, free) and exit() functions
-#include <string.h>   // String functions (strcmp for comparison)
+#include <string.h>   // String functions (strcmp, strncmp for comparison)
+
+/**
+* MetaCommandResult - Status codes for meta-command processing
+*
+* Meta-commands are special commands that start with a dot (.)
+*/
+typedef enum {
+  META_COMMAND_SUCCESS,
+  META_COMMAND_UNRECOGNIZED
+} MetaCommandResult;
+
+/**
+* PrepareResult - Status codes for statement parsing
+* 
+* Indicates whether a SQL-like command was successfully parsed
+* into a Statement structure.
+*/
+typedef enum {
+  PREPARE_SUCCESS,
+  PREPARE_UNRECOGNIZED_STATEMENT
+} PrepareResult;
+
+/**
+* StatementType - Available database operations
+*
+* SQL operations:
+* - INSERT: Add a new row to the database
+* - SELECT: Retrieve rows from the database
+*/
+typedef enum {
+  STATEMENT_INSERT,
+  STATEMENT_SELECT
+} StatementType;
 
 
 /** 
@@ -16,6 +49,14 @@ typedef struct {
   size_t buffer_length;   // Total capacity of the buffer (How much memory is reserved)
   ssize_t input_length;   // Real input length (getline returns this, minus the newline)
 } InputBuffer;
+
+/**
+ * Statement - Represents a parsed SQL-like command
+*/ 
+typedef struct {
+  StatementType type; // STATEMENT_INSERT, STATEMENT_SELECT, etc.
+} Statement;
+
 
 /**
 * new_input_buffer - Creates and initializes a new InputBuffer structure
@@ -54,7 +95,7 @@ void read_input(InputBuffer* input_buffer) {
   // getline() reads an entire line from stdin
   // Parameters:
   //  &(input_buffer->buffer) - Address of the buffer pointer (allows reallocation)
-  //  &(input_length->buffer_length) - Address of size variable (gets updated)
+  //  &(input_buffer->buffer_length) - Address of size variable (gets updated)
   //  stdin - Standard input (keyboard)
   // Returns: number of bytes read (inluding newline), or -1 on error
   ssize_t bytes_read =
@@ -88,17 +129,95 @@ void close_input_buffer(InputBuffer* input_buffer) {
 */
 void print_prompt() { printf("Ema's db > "); }
 
+/**
+* do_meta_command - Handles dot-commands (.exit, .help, etc.)
+*
+* @input_buffer:  Contains the raw user input to check for meta-commands
+*
+* Return: META_COMMAND_SUCCESS if command was handled,
+*         META_COMMAND_UNRECOGNIZED otherwise
+*/
+MetaCommandResult do_meta_command(InputBuffer* input_buffer) {
+  if (strcmp(input_buffer->buffer, ".exit") == 0) {
+    close_input_buffer(input_buffer); // Clean up before exiting
+    exit(EXIT_SUCCESS);
+  } else {
+    return META_COMMAND_UNRECOGNIZED;
+  }
+}
+
+/**
+* prepare_statement - Parses user input into a Statement struct
+*
+* Converts a raw command string like "insert" or "select" into a typed
+* Statement object that can be executed
+*
+* @input_buffer: Contains the raw user input (e.g., "insert into users...")
+* @statement: Pointer to Statement struct that will be filled with parsed data
+*
+* Return: PREPARE_SUCCESS if command is recognized,
+*         PREPARE_UNRECOGNIZED_STATEMENT otherwise
+*/
+PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
+  if (strncmp(input_buffer->buffer, "insert", 6) == 0){
+    statement->type = STATEMENT_INSERT;
+    return PREPARE_SUCCESS;
+  }
+  if (strcmp(input_buffer->buffer, "select") == 0) {
+    statement->type = STATEMENT_SELECT;
+    return PREPARE_SUCCESS;
+  }
+
+  return PREPARE_UNRECOGNIZED_STATEMENT;
+}
+
+/**
+* execute_statement - Run a prepared statement
+* 
+* Performs the actual database operation based on the statement type
+* 
+* @statement: The parsed statement to execute
+*/
+void execute_statement(Statement* statement) {
+  switch (statement->type) {
+    case (STATEMENT_INSERT):
+      printf("Insert do here \n");
+      break;
+    case (STATEMENT_SELECT):
+      printf("Select do here \n");
+      break;
+  }
+}
+
+/**
+* Main REPL (Read-Eval-Print Loop)
+*/
 int main(int argc, char* argv[]) {
   InputBuffer* input_buffer = new_input_buffer();
   while (true) {
     print_prompt();
     read_input(input_buffer);
 
-    if (strcmp(input_buffer->buffer, ".exit") == 0) {
-      close_input_buffer(input_buffer);
-      exit(EXIT_SUCCESS);
-    } else {
-      printf("Unrecognized command '%s'.\n", input_buffer->buffer);
+    if (input_buffer->buffer[0] == '.') {
+      switch (do_meta_command(input_buffer)) {
+        case (META_COMMAND_SUCCESS):
+          continue;
+        case (META_COMMAND_UNRECOGNIZED):
+          printf("Unrecognized command '%s' \n", input_buffer->buffer);
+          continue;
+      }
     }
+
+    Statement statement;
+    switch (prepare_statement(input_buffer, &statement)) {
+      case (PREPARE_SUCCESS):
+        break;
+      case (PREPARE_UNRECOGNIZED_STATEMENT):
+        printf("Unrecognized keyword at start of '%s' \n", input_buffer->buffer);
+        continue;
+    }
+    
+    execute_statement(&statement);
+    printf("Executed \n");
   }
 }
