@@ -3,8 +3,11 @@
 #include <stdbool.h>  // Boolean values
 #include <stdio.h>    // Standard inputs/outpus functions (printf, getline)
 #include <stdlib.h>   // Memory allocation (mallc, free) and exit() functions
-#include <string.h>   // String functions (strcmp, strncmp for comparison)
+#include <string.h>   // String functions (strcmp, strncmp, memcpy, strtok)
 #include <stdint.h>   // Fixed-width integer types (uint32_t)
+#include <errno.h>    // Error handling (errno variable for system errors)
+#include <unistd.h>   // POSIX API (read, write, lseek, close)
+#include <fcntl.h>    // File control (open, O_RDWR, O_CREAT flags)
 
 
 // ENUMS - Status codes for different operations
@@ -21,7 +24,7 @@ typedef enum {
 
 /**
 * PrepareResult - Status codes for statement parsing
-* 
+*
 * Indicates whether a SQL-like command was successfully parsed
 * into a Statement structure
 */
@@ -83,12 +86,12 @@ typedef struct {
 
 /**
 * Row - A single record/row in the database
-* 
+*
 * Represents one entry in the database with:
 * - Unique identifier (id)
 * - Username (max 32 characters)
 * - Email address (max 255 characters)
-* 
+*
 * Total size: 4 + 32 + 255 = 291 bytes
 */
 typedef struct {
@@ -108,17 +111,35 @@ typedef struct {
 } Statement;
 
 /**
+* Pager - Manages the interface between memory and disk storage
+*
+* The pager is responsible for:
+*   1. Keeping the database file open (file_descriptor)
+*   2. Tracking the file size (file_length)
+*   3. Caching pages in memory to avoid repeated disk reads
+*
+* Pages are loaded lazily (only when accessed) and cached until
+* the database is closed. Modified pages are flushed to disk
+*/
+typedef struct {
+  int file_descriptor;
+  uint32_t file_length;
+  void* pages[TABLE_MAX_PAGES];
+} Pager;
+
+/**
 * Table - In-memory database table
 *
 * Uses a paged memory system where rows are stored in fixed-size pages (4KB each)
 * Each page can hold multiple rows (ROWS_PER_PAGE). Pages are allocated on-demand
+* and cached by the Pager
 *
 * @num_rows: Total number of rows currently in the table
-* @pages: Array of pointers to memory pages (each page is PAGE_SIZE bytes)
+* @pager: Pointer to the Pager that manages disk storage
 */
 typedef struct {
   uint32_t num_rows;
-  void* pages[TABLE_MAX_PAGES];
+  Pager* pager;
 } Table;
 
 
@@ -153,15 +174,15 @@ const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;  // ~1400 rows 
 
  /**
  * memcpy - Copies a block of memory from source to destination
- * 
+ *
  * void *memcpy(void *dest, const void *src, size_t n);
- * 
+ *
  * @dest: Pointer to the destination memory location (where to copy to)
  * @src:  Pointer to the source memory location (what to copy from)
  * @n:    Number of bytes to copy
- * 
+ *
  * Return: Pointer to dest (the destination address)
- * 
+ *
  * IMPORTANT:
  *   - Copies EXACTLY n bytes, no more, no less
  *   - Does NOT check for overlapping memory regions
@@ -207,10 +228,66 @@ void deserialize_row(void* source, Row* destination) {
 }
 
 /**
+* get_page - Retrieve a page from cache or disk
+*
+* Implements lazy loading with caching:
+*   - If page is already in memory cache, return it immediately (cache hit)
+*   - If not, allocate memory, read from disk (if the page exists in the file),
+*     and store it in the cache for future access (cache miss)
+*
+* This function is the core of the persistence layer. It abstracts away
+* whether a page is in memory or on disk
+*
+* @pager: The pager managing the database file
+* @page_num: Page index (0-based)
+*
+* Return: Pointer to the page in memory (ready to read/write)
+*/
+void* get_page(Pager* pager, uint32_t page_num){
+  if (page_num > TABLE_MAX_PAGES) {
+    printf("Tried to fetch page number out of bounds %d > %d\n", page_num, TABLE_MAX_PAGES);
+    exit(EXIT_FAILURE);
+  }
+
+  // Check if page is already cached
+  if (pager->pages[page_num] == NULL) {
+    // Cache miss. Allocate memory and load from file
+    void* page = malloc(PAGE_SIZE);
+
+    // Calculate how many pages exist in the file
+    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+
+    // We might save a partial page at the end of the file
+    if (pager->file_length % PAGE_SIZE) {
+      num_pages += 1;
+    }
+
+    // If the page exists in the file, read it
+    if (page_num < num_pages) {
+      // Seek (pointer) to the page position in the file
+      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+
+      // Read the page from disk
+      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+      if (bytes_read == -1) {
+        printf("Error reading file: %d\n", errno);
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    // Store the page in cache for future access
+    pager->pages[page_num] = page;
+  }
+
+  // Return the page (either from cache or newly loaded)
+  return pager->pages[page_num];
+}
+
+/**
 * row_slot - Calculate the memory address for a specific row number
 *
 * Given a row number, determines which page and which offset within that page
-* the row should be stored at. Allocates a new page if it doesn't exist
+* the row should be stored at. Uses get_page() to ensure the page is loaded
 *
 * @table: Pointer to the Table structure
 * @row_num: Row number (0-indexed) to locate
@@ -221,12 +298,7 @@ void* row_slot(Table* table, uint32_t row_num) {
   // Calculate which page contains this row
   uint32_t page_num = row_num / ROWS_PER_PAGE;
 
-  // Get the page pointer (or allocate if NULL)
-  void* page = table->pages[page_num];
-  if (page == NULL) {
-    // Lazy allocation: only allocate when first accessing a page
-    page = table->pages[page_num] = malloc(PAGE_SIZE);
-  }
+  void* page = get_page(table->pager, page_num);
 
   // Calculate position within the page
   uint32_t row_offset = row_num % ROWS_PER_PAGE;
@@ -305,42 +377,166 @@ void close_input_buffer(InputBuffer* input_buffer) {
 }
 
 
-// TABLE FUNCTIONS
+// PERSISTENCE FUNCTIONS (Disk storage management)
 
 /**
-* new_table - Creates and initializes a new Table structure
+* pager_open - Open (or create) the database file
 *
-* Allocates memory for a Table object and initializes all pages to NULL
-* The table starts empty with 0 rows
+* Opens the file with read/write permissions, creates it if it doesn't exist
+* Sets user read/write permissions (S_IRUSR | S_IWUSR)
 *
-* Return: Pointer to the newly created Table structure
+* @filename: Path to the database file
+*
+* Return: Newly allocated Pager structure
+*
+* Flags explained:
+*   O_RDWR   - Open for reading and writing
+*   O_CREAT  - Create the file if it doesn't exist
+*   S_IRUSR  - Owner can read
+*   S_IWUSR  - Owner can write
 */
-Table* new_table() {
-  Table* table = malloc(sizeof(Table));
-  table->num_rows = 0;
+Pager* pager_open(const char* filename) {
+  int fd = open(filename,
+                  O_RDWR | O_CREAT, // Read/Write mode | Create file if it doesnt exist
+                  S_IWUSR | S_IRUSR // User write|read permissions
+                );
 
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++){
-    table->pages[i] = NULL;
+  if (fd == -1) {
+    printf("Unable to open file\n");
+    exit(EXIT_FAILURE);
   }
+
+  // Seek to the end to get the file size
+  off_t file_length = lseek(fd, 0, SEEK_END);
+
+  // Allocate and initialize the Pager structure
+  Pager* pager = malloc(sizeof(Pager));
+  pager->file_descriptor = fd;
+  pager->file_length = file_length;
+
+  // Initialize all page cache slots to NULL (no pages loaded yet)
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    pager->pages[i] = NULL;
+  }
+
+  return pager;
+}
+
+/**
+* pager_flush - Write a memory page to disk
+*
+* Writes the contents of a cached page to the database file at the
+* correct position (page_num * PAGE_SIZE). This function is called
+* when closing the database to ensure all changes are saved
+*
+* @pager: The pager managing the database file
+* @page_num: Which page to flush
+* @size: Number of bytes to write (PAGE_SIZE for full pages, less for last page)
+*/
+void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+  if (pager->pages[page_num] == NULL) {
+    printf("Tried to flush null page\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Seek to the page position in the file
+  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+  if (offset == -1) {
+    printf("Error seeking: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+
+  // Write the page contents to disk
+  ssize_t bytes_written = write(pager->file_descriptor, pager->pages[page_num], size);
+  if (bytes_written == -1){
+    printf("Error writing: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+}
+
+/**
+* db_open - Open the database and restore state from disk
+*
+* Opens the database file and calculates how many rows exist based
+* on the file size. Each row occupies ROW_SIZE bytes
+*
+* @filename: Path to the database file
+*
+* Return: Newly allocated Table structure with restored state
+*/
+Table* db_open(const char* filename) {
+  // Open the pager (which opens the file)
+  Pager* pager = pager_open(filename);
+
+  // Calculate number of rows from the file size
+  // If file_length is 1455 bytes and ROW_SIZE is 293, that's exactly 4 rows
+  uint32_t num_rows = pager->file_length / ROW_SIZE;
+
+  // Create and initialize the Table
+  Table* table = malloc(sizeof(Table));
+  table->num_rows = num_rows;
+  table->pager = pager;
 
   return table;
 }
 
 /**
-* free_table - Frees all memory used by the Table
+* db_close - Save all changes and close the database
 *
-* Iterates through all pages and frees each allocated page, then frees the
-* Table structure itself.
+* Flushes all modified pages to disk (full pages then partial last page),
+* closes the file descriptor, and frees all allocated memory
 *
-* @table: Pointer to Table to be freed
+* @table: The database to close
 */
-void free_table(Table* table) {
-  // Free each allocated page
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    if (table->pages[i] != NULL) free(table->pages[i]);
+void db_close(Table* table) {
+  Pager* pager = table->pager;
+
+  // Calculate how many pages contain data (including partial last page)
+  uint32_t num_pages_with_data = (table->num_rows + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
+
+  // Flush (save) all pages that are in cache and have data
+  for (uint32_t i = 0; i < num_pages_with_data; i++) {
+    if (pager->pages[i] == NULL)
+      continue; // Page not in cache, nothing to flush
+
+    // Determine how many bytes to write for this page
+    uint32_t bytes_to_write;
+    if (i == num_pages_with_data - 1) {
+      // Last page - may be partially filled
+      uint32_t rows_in_last_page = table->num_rows % ROWS_PER_PAGE;
+      if(rows_in_last_page == 0){
+        bytes_to_write = PAGE_SIZE; // Exactly full
+      } else {
+        bytes_to_write = rows_in_last_page * ROW_SIZE;
+      }
+    } else {
+      bytes_to_write = PAGE_SIZE; // Complete Page
+    }
+
+    // Write the page to disk
+    pager_flush(pager, i, bytes_to_write);
   }
+
+  // Free all cached pages from memory
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (pager->pages[i] != NULL) {
+      free(pager->pages[i]);
+      pager->pages[i] = NULL;
+    }
+  }
+
+  // Close the file descriptor
+  int result = close(pager->file_descriptor);
+  if (result == -1) {
+    printf("Error closing db file\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Free the pager and table structures
+  free(pager);
   free(table);
 }
+
 
 
 // USER INTERFACE FUNCTIONS
@@ -374,7 +570,7 @@ void print_row(Row* row) {
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     close_input_buffer(input_buffer); // Clean up input buffer
-    free_table(table);                // Clean up table
+    db_close(table);                // Clean up database
     exit(EXIT_SUCCESS);
   } else {
     return META_COMMAND_UNRECOGNIZED;
@@ -384,25 +580,55 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
 
 // STATEMENT PREPARATION (Parsing user input)
 
+/**
+* prepare_insert - Parse an INSERT command into a Statement
+*
+* Breaks down the input string using strtok() to extract:
+*   - id (integer)
+*   - username (string)
+*   - email (string)
+*
+* Validates that:
+*   - All three arguments are present
+*   - ID is not negative
+*   - Username length is within COLUMN_USERNAME_SIZE
+*   - Email length is within COLUMN_EMAIL_SIZE
+*
+* @input_buffer: Contains the raw user input (e.g., "insert 1 Ema ema@mail.com")
+* @statement: Pointer to Statement struct that will be filled with parsed data
+*
+* Return: PREPARE_SUCCESS if parsed correctly,
+*         PREPARE_SYNTAX_ERROR if arguments missing,
+*         PREPARE_NEGATIVE_ID if ID < 0,
+*         PREPARE_STRING_TOO_LONG if string exceeds column limit
+*/
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   statement->type = STATEMENT_INSERT;
 
-  strtok(input_buffer->buffer, " ");
-  char* id_string = strtok(NULL, " ");
-  char* username = strtok(NULL, " ");
-  char* email = strtok(NULL, " ");
+  // Tokenize the input string by spaces
+  // Example: "insert 1 Ema ema@mail.com"
+  //   After strtok: "insert", "1", "Ema", "ema@mail.com"
+  strtok(input_buffer->buffer, " ");     // Skip the "insert" keyword
+  char* id_string = strtok(NULL, " ");   // Get ID token
+  char* username = strtok(NULL, " ");    // Get username token
+  char* email = strtok(NULL, " ");       // Get email token
 
+  // Validate that all arguments were provided
   if (id_string == NULL || username == NULL || email == NULL) 
     return PREPARE_SYNTAX_ERROR;
 
+  // Convert ID from string to integer
   int id = atoi(id_string);
+  // Validate ID is not negative
   if(id < 0)
     return PREPARE_NEGATIVE_ID;
+  // Validate string lengths (not including null terminator)
   if(strlen(username) > COLUMN_USERNAME_SIZE)
     return PREPARE_STRING_TOO_LONG;
   if(strlen(email) > COLUMN_EMAIL_SIZE)
     return PREPARE_STRING_TOO_LONG;
-  
+
+  // Copy the parsed data into the statement
   statement->row_to_insert.id = id;
   strcpy(statement->row_to_insert.username, username);
   strcpy(statement->row_to_insert.email, email);
@@ -441,6 +667,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 * execute_insert - Inserts a new row into the database
 *
 * Takes the row from the statement and stores it in the table's memory pages.
+* The data is written to the page cache but not immediately flushed to disk.
 *
 * @statement: Contains the row to insert
 * @table: Target table for the insertion
@@ -459,7 +686,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
   // Find the memory location for this row
   void* slot = row_slot(table, table->num_rows);
 
-  // Convert the Row to raw bytes and store it
+  // Convert the Row to raw bytes and store it in the page cache
   serialize_row(row_to_insert, slot);
   table->num_rows += 1;
 
@@ -467,26 +694,26 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
 }
 
 /**
- * execute_select - Retrieves and displays all rows from the database
- * 
- * Iterates through all rows in the table, deserializes them from raw bytes
- * back into Row structures, and prints them.
- * 
- * @statement: Statement structure (not used, but kept for consistency)
- * @table: Source table to query
- * 
- * Return: Always returns EXECUTE_SUCCESS
- * 
- * Algorithm:
- *   1. Create a temporary Row structure
- *   2. For each row number from 0 to num_rows-1:
- *      a. Find the memory location using row_slot()
- *      b. Deserialize the raw bytes into the Row structure
- *      c. Print the Row contents
+* execute_select - Retrieves and displays all rows from the database
+*
+* Iterates through all rows in the table, deserializes them from raws bytes
+* back into Row structures, and prints them.
+*
+* @statement: Statement structure (not used, but kept for consistency)
+* @table: Source table to query
+*
+* Return: Always returns EXECUTE_SUCCESS
+*
+* Algorithm:
+*   1. Create a temporary Row structure
+*   2. For each row number from 0 to num_rows-1:
+*      a. Find the memory location using row_slot()
+*      b. Deserialize the raw bytes into the Row structure
+*      c. Print the Row contents
 */
 ExecuteResult execute_select(Statement* statement, Table* table) {
   Row row;
-  
+
   for (uint32_t i = 0; i < table->num_rows; i++) {
     // Find where the row is stored
     void* slot = row_slot(table, i);
@@ -523,9 +750,19 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
 * Main REPL (Read-Eval-Print Loop)
 */
 int main(int argc, char* argv[]) {
-  Table* table = new_table();
+  if (argc < 2) {
+    printf("Must supply a database filename\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Open the database file (creates if not exists, restores state if exists)
+  char* filename = argv[1];
+  Table* table = db_open(filename);
+
+  // Create input buffer for user input
   InputBuffer* input_buffer = new_input_buffer();
 
+  // Main REPL loop
   while (true) {
     print_prompt();
     read_input(input_buffer);

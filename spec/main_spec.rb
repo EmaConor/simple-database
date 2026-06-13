@@ -1,9 +1,13 @@
 # RUN  -  rspec spec/main_spec.rb
 
 describe 'database' do
+  before do
+    `rm -rf test.db`
+  end
+
   def run_script(commands)
     raw_output = nil
-    IO.popen("./main", "r+") do |pipe|
+    IO.popen("./main test.db", "r+") do |pipe|
       commands.each do |command|
         pipe.puts command
       end
@@ -82,6 +86,26 @@ describe 'database' do
     expect(result).to match_array([
       "Ema's db > ID must be positive",
       "Ema's db > Executed",
+      "Ema's db > "
+    ])
+  end
+
+  it 'keeps data after closing connetion' do
+    result1 = run_script([
+      "insert 1 ema ema@ema.ema",
+      ".exit",
+    ])
+    expect(result1).to match_array([
+      "Ema's db > Executed",
+      "Ema's db > ",
+    ])
+    result2 = run_script([
+      "select",
+      ".exit"
+    ])
+    expect(result2).to match_array([
+      "Ema's db > (1, ema, ema@ema.ema)",
+      "Executed",
       "Ema's db > "
     ])
   end
